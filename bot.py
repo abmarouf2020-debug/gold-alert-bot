@@ -112,61 +112,64 @@ def send_startup():
     )
 
 # ─────────────────────────────────────────────
-# DATA FETCH — Stooq (رایگان، بدون محدودیت)
+# DATA FETCH — TwelveData (رایگان، 800 req/day، بدون مسدودی)
 # ─────────────────────────────────────────────
-STOOQ_INTERVALS = {
-    "1d":  "d",
-    "1h":  "h",
-    "15m": "15",
-    "5m":  "5",
+TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "demo")
+
+TD_INTERVALS = {
+    "1d":  "1day",
+    "1h":  "1h",
+    "15m": "15min",
+    "5m":  "5min",
 }
 
 def fetch_ohlcv(interval: str, bars: int = 200) -> Optional[pd.DataFrame]:
     """
-    Fetch gold data from Stooq — رایگان و بدون API key
-    Symbol: XAUUSD
+    Fetch gold data from TwelveData — رایگان (نیاز به API key رایگان)
+    Symbol: XAU/USD
     """
-    stooq_int = STOOQ_INTERVALS.get(interval, "d")
-    url = f"https://stooq.com/q/d/l/?s=xauusd&i={stooq_int}"
+    td_interval = TD_INTERVALS.get(interval, "1day")
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": "XAU/USD",
+        "interval": td_interval,
+        "outputsize": min(bars, 500),
+        "apikey": TWELVEDATA_KEY,
+        "format": "JSON",
+    }
 
     for attempt in range(3):
         try:
-            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200 or len(r.text) < 50:
-                raise ValueError(f"Bad response: {r.status_code}")
+            r = requests.get(url, params=params, timeout=15,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            data = r.json()
 
-            df = pd.read_csv(io.StringIO(r.text))
-            df.columns = [c.strip().title() for c in df.columns]
+            if "code" in data and data.get("code") != 200:
+                raise ValueError(f"API error: {data.get('message', data)}")
 
-            # Rename columns to standard names
-            col_map = {}
-            for c in df.columns:
-                cl = c.lower()
-                if "open"  in cl: col_map[c] = "Open"
-                if "high"  in cl: col_map[c] = "High"
-                if "low"   in cl: col_map[c] = "Low"
-                if "close" in cl: col_map[c] = "Close"
-                if "vol"   in cl: col_map[c] = "Volume"
-            df.rename(columns=col_map, inplace=True)
+            if "values" not in data:
+                raise ValueError(f"No 'values' in response: {data}")
+
+            df = pd.DataFrame(data["values"])
+            df.rename(columns={
+                "open": "Open", "high": "High",
+                "low": "Low", "close": "Close",
+            }, inplace=True)
 
             needed = ["Open", "High", "Low", "Close"]
-            if not all(c in df.columns for c in needed):
-                raise ValueError(f"Missing columns: {df.columns.tolist()}")
-
-            df = df[needed].dropna().tail(bars)
-            df = df.apply(pd.to_numeric, errors="coerce").dropna()
+            df = df[needed].apply(pd.to_numeric, errors="coerce").dropna()
+            df = df.iloc[::-1].reset_index(drop=True)  # TwelveData چینش نزولی می‌دهد، برعکسش می‌کنیم
 
             if len(df) < 10:
                 raise ValueError("Too few rows")
 
-            log.info(f"✅ Fetched {len(df)} bars [{interval}] from Stooq")
+            log.info(f"✅ Fetched {len(df)} bars [{interval}] from TwelveData")
             return df
 
         except Exception as e:
-            log.warning(f"Stooq attempt {attempt+1}/3 [{interval}]: {e}")
+            log.warning(f"TwelveData attempt {attempt+1}/3 [{interval}]: {e}")
             time.sleep(3)
 
-    # Fallback: try alternative source (investing.com via rapidapi style URL)
     log.error(f"❌ All fetch attempts failed for [{interval}]")
     return None
 
