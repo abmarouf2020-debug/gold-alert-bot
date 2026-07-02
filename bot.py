@@ -406,10 +406,26 @@ class GoldBot:
         direction  = "BUY" if bias == "BULLISH" else "SELL"
         ob_dir     = "bullish" if direction == "BUY" else "bearish"
 
-        if direction == "BUY"  and zone != "DISCOUNT": log.info("BUY but PREMIUM — skip."); return None
-        if direction == "SELL" and zone != "PREMIUM":  log.info("SELL but DISCOUNT — skip."); return None
+        # Zone filter نرم‌تر: فقط extreme مخالف را رد کن
+        h20 = df_d["High"].tail(20).max()
+        l20 = df_d["Low"].tail(20).min()
+        rng = h20 - l20
+        eq  = l20 + rng * 0.5
+        extreme_premium  = price > l20 + rng * 0.75
+        extreme_discount = price < l20 + rng * 0.25
+        if direction == "BUY"  and extreme_premium:
+            log.info("BUY but EXTREME PREMIUM — skip."); return None
+        if direction == "SELL" and extreme_discount:
+            log.info("SELL but EXTREME DISCOUNT — skip."); return None
 
-        obs = find_order_blocks(df_1h, ob_dir)
+        log.info(f"Zone OK — proceeding ({zone})")
+
+        # OB روی 4H (هر 4 کندل 1H را ادغام می‌کنیم)
+        df_4h = df_1h.groupby(df_1h.index // 4).agg(
+            {"Open":"first","High":"max","Low":"min","Close":"last"}).dropna()
+        obs_4h = find_order_blocks(df_4h, ob_dir)
+        obs_1h = find_order_blocks(df_1h, ob_dir)
+        obs = obs_4h + obs_1h  # 4H اول، 1H دوم
         if not obs:
             log.info("No OB found.")
             return None
