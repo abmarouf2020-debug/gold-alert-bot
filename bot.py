@@ -188,27 +188,29 @@ def is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
 
 def market_bias(df: pd.DataFrame) -> str:
-    if len(df) < 50:
+    if len(df) < 20:
         return "NEUTRAL"
     c = df["Close"]
     ema20 = c.ewm(span=20).mean().iloc[-1]
-    ema50 = c.ewm(span=50).mean().iloc[-1]
+    ema50 = c.ewm(span=min(50, len(c)-1)).mean().iloc[-1]
     highs = df["High"].tail(5).values
     lows  = df["Low"].tail(5).values
+    # اضافه: EMA200 برای تأیید روند بلندمدت
+    ema200 = c.ewm(span=min(200, len(c)-1)).mean().iloc[-1]
     bull = sum([
         c.iloc[-1] > ema20,
         ema20 > ema50,
+        c.iloc[-1] > ema200,
         all(highs[i] >= highs[i-1] for i in range(1,5)),
-        all(lows[i]  >= lows[i-1]  for i in range(1,5)),
     ])
     bear = sum([
         c.iloc[-1] < ema20,
         ema20 < ema50,
+        c.iloc[-1] < ema200,
         all(highs[i] <= highs[i-1] for i in range(1,5)),
-        all(lows[i]  <= lows[i-1]  for i in range(1,5)),
     ])
-    if bull >= 3: return "BULLISH"
-    if bear >= 3: return "BEARISH"
+    if bull >= 2: return "BULLISH"
+    if bear >= 2: return "BEARISH"
     return "NEUTRAL"
 
 def price_zone(df: pd.DataFrame) -> str:
