@@ -1,192 +1,483 @@
-# ═══════════════════════════════════════════════════
-# تابع تحلیل ارتقاء‌یافته با سه لنز وایکوفی
-# ═══════════════════════════════════════════════════
-def analyze_symbol(sym: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> Optional[Dict]:
-    """
-    تحلیل یک نماد با SMC (OB, BOS, FVG) + بهبودهای وایکوف:
-    1. تست محدوده (Test)
-    2. چشمه معتبر (Valid Spring)
-    3. تلاش و نتیجه (Effort vs Result)
-    """
+"""
+Multi-Symbol Alert Bot v5
+=========================
+High Win Rate Strategy: EMA + OB + BOS + FVG + Kill Zone
+Target Win Rate: 78-82%
+Symbols: XAUUSD + Major Forex Pairs
+R:R 1:2 | Alerts: Entry, TP, SL, Monthly
+"""
+import os, time, logging, requests, sqlite3
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from typing import Optional
+import pandas as pd
 
-    # ── ۱. تشخیص روند اصلی (EMA 200 روی ۱h) ──
-    df_1h['EMA200'] = df_1h['close'].ewm(span=200, adjust=False).mean()
-    trend_bias = "Bullish" if df_1h['close'].iloc[-1] > df_1h['EMA200'].iloc[-1] else "Bearish"
+# ── LOGGING ──────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(),
+              logging.FileHandler("bot.log", encoding="utf-8")])
+log = logging.getLogger("Bot")
 
-    # ── ۲. آماده‌سازی دیتافریم ۱۵m ──
-    o = df_15m['open'].astype(float)
-    h = df_15m['high'].astype(float)
-    l = df_15m['low'].astype(float)
-    c = df_15m['close'].astype(float)
+# ── CONFIG ───────────────────────────────────
+TG_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
+TG_CHAT   = os.environ.get("TELEGRAM_CHAT_ID", "")
+INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "300"))
+COOLDOWN  = int(os.environ.get("COOLDOWN_MINUTES", "180"))
+TD_KEY    = os.environ.get("TWELVEDATA_KEY", "demo")
+MIN_SCORE = int(os.environ.get("MIN_SCORE", "7"))
 
-    # محاسبه ATR 14 برای اندازه‌گیری نوسان
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
-    avg_body = (c - o).abs().rolling(20).mean().iloc[-1]  # میانگین بدنه‌ی کندل‌ها
+# ── SYMBOLS ──────────────────────────────────
+SYMBOLS = {
+    "XAUUSD": {"td":"XAU/USD", "emoji":"🥇", "dec":2},
+    "EURUSD": {"td":"EUR/USD", "emoji":"💶", "dec":5},
+    "GBPUSD": {"td":"GBP/USD", "emoji":"💷", "dec":5},
+    "USDJPY": {"td":"USD/JPY", "emoji":"💴", "dec":3},
+    "AUDUSD": {"td":"AUD/USD", "emoji":"🦘", "dec":5},
+    "USDCAD": {"td":"USD/CAD", "emoji":"🍁", "dec":5},
+}
 
-    # ── ۳. یافتن آخرین BOS (شکست ساختار) ──
-    # برای سادگی، از سوئینگ‌های ۱۵ کندل اخیر استفاده می‌کنیم.
-    lookback = 10
-    recent_high = h.iloc[-lookback:].max()
-    recent_low  = l.iloc[-lookback:].min()
-    last_close  = c.iloc[-1]
+# ── KILL ZONES (UTC) ─────────────────────────
+KILL_ZONES = {
+    "London Open":   (7*60,   9*60),
+    "New York Open": (13*60, 15*60),
+    "London Close":  (16*60+30, 17*60+30),
+}
 
-    bos_bull = last_close > recent_high   # شکست سقف قبلی
-    bos_bear = last_close < recent_low    # شکست کف قبلی
+def get_kill_zone() -> Optional[str]:
+    now = datetime.now(timezone.utc)
+    m = now.hour*60 + now.minute
+    for name,(s,e) in KILL_ZONES.items():
+        if s <= m <= e: return name
+    return None
 
-    # ── ۴. تشخیص Order Block (OB) ──
-    # یک روش ساده: برای خرید، آخرین کندل نزولی قبل از یک حرکت صعودی قوی
-    # (کندلی که Low آن پایین‌تر از کندل قبلی است و سپس قیمت برگشته بالا)
-    ob_high = ob_low = None
-    ob_valid = False
+def is_weekend() -> bool:
+    return datetime.now(timezone.utc).weekday() >= 5
 
-    # --- جستجوی OB صعودی (برای BUY) ---
-    if trend_bias == "Bullish":
-        # آخرین کندل کاملاً نزولی (close < open) که قبل از یک برگشت بوده
-        for i in range(len(c)-2, 1, -1):
-            if c[i] < o[i] and c[i+1] > o[i+1] and h[i] < h[i+1]:  # یک کندل نزولی و سپس صعودی
-                ob_high = h[i]
-                ob_low  = l[i]
-                # کیفیت: بدنه بزرگ‌تر از میانگین و سایه‌های کوچک
-                body = abs(c[i] - o[i])
-                upper_wick = h[i] - max(c[i], o[i])
-                lower_wick = min(c[i], o[i]) - l[i]
-                if body > 1.5 * avg_body and upper_wick < 0.3 * body and lower_wick < 0.3 * body:
-                    ob_valid = True
-                    break
-    # --- جستجوی OB نزولی (برای SELL) ---
-    else:
-        for i in range(len(c)-2, 1, -1):
-            if c[i] > o[i] and c[i+1] < o[i+1] and l[i] > l[i+1]:  # کندل صعودی و سپس نزولی
-                ob_high = h[i]
-                ob_low  = l[i]
-                body = abs(c[i] - o[i])
-                upper_wick = h[i] - max(c[i], o[i])
-                lower_wick = min(c[i], o[i]) - l[i]
-                if body > 1.5 * avg_body and upper_wick < 0.3 * body and lower_wick < 0.3 * body:
-                    ob_valid = True
-                    break
+# ── DATABASE ─────────────────────────────────
+def init_db():
+    con = sqlite3.connect("journal.db")
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT, direction TEXT, price REAL,
+        entry_high REAL, entry_low REAL,
+        sl REAL, tp REAL, score INTEGER,
+        bias TEXT, kill_zone TEXT, ts TEXT,
+        outcome TEXT DEFAULT 'OPEN',
+        exit_price REAL, exit_ts TEXT, r_mult REAL
+    );""")
+    con.commit(); con.close()
 
-    if not ob_valid:
-        # اگر OB معتبر یافت نشد، ستاپی وجود ندارد
-        return None
+def save_signal(sym,direction,price,eh,el,sl,tp,score,bias,kz) -> int:
+    con = sqlite3.connect("journal.db")
+    cur = con.execute("""INSERT INTO signals
+        (symbol,direction,price,entry_high,entry_low,
+         sl,tp,score,bias,kill_zone,ts)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (sym,direction,price,eh,el,sl,tp,score,bias,kz,
+         datetime.now(timezone.utc).isoformat()))
+    con.commit(); sid=cur.lastrowid; con.close()
+    return sid
 
-    # ── ۵. تشخیص FVG (شکاف ارزش منصفانه) ──
-    fvg_bull = fvg_bear = False
-    # FVG صعودی: Low کندل فعلی > High دو کندل قبل
-    if len(c) >= 3 and l.iloc[-1] > h.iloc[-3]:
-        fvg_bull = True
-    # FVG نزولی: High کندل فعلی < Low دو کندل قبل
-    if len(c) >= 3 and h.iloc[-1] < l.iloc[-3]:
-        fvg_bear = True
+def close_signal(sid, outcome, exit_price, r):
+    con = sqlite3.connect("journal.db")
+    con.execute("""UPDATE signals SET outcome=?,exit_price=?,
+        exit_ts=?,r_mult=? WHERE id=?""",
+        (outcome,exit_price,
+         datetime.now(timezone.utc).isoformat(),r,sid))
+    con.commit(); con.close()
 
-    # ── ۶. بهبودهای وایکوف ──
+def monthly_stats() -> dict:
+    con = sqlite3.connect("journal.db")
+    now = datetime.now(timezone.utc)
+    start = now.replace(day=1,hour=0,minute=0,second=0).isoformat()
+    rows = con.execute("""SELECT symbol,outcome,r_mult,kill_zone
+        FROM signals WHERE ts >= ?""", (start,)).fetchall()
+    con.close()
+    total=len(rows); wins=losses=opens=0; net=0.0
+    by_sym={}; by_kz={}
+    for r in rows:
+        sym,outcome,rm,kz = r
+        if outcome=="WIN": wins+=1; net+=rm or 0
+        elif outcome=="LOSS": losses+=1; net+=rm or 0
+        else: opens+=1
+        if sym not in by_sym: by_sym[sym]=[0,0]
+        if outcome=="WIN": by_sym[sym][0]+=1
+        elif outcome=="LOSS": by_sym[sym][1]+=1
+        if kz not in by_kz: by_kz[kz]=[0,0]
+        if outcome=="WIN": by_kz[kz][0]+=1
+        elif outcome=="LOSS": by_kz[kz][1]+=1
+    wr=round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0
+    return dict(total=total,wins=wins,losses=losses,opens=opens,
+                net=round(net,2),wr=wr,by_sym=by_sym,by_kz=by_kz)
 
-    # ۶.۱ تست محدوده (Test): قیمت باید به داخل OB برگشته باشد
-    # یعنی کندل جاری (یا قبلی) با OB تماس داشته باشد
-    latest_low  = l.iloc[-1]
-    latest_high = h.iloc[-1]
-    price_in_ob = (ob_low <= latest_low <= ob_high) or (ob_low <= latest_high <= ob_high)
+# ── TELEGRAM ─────────────────────────────────
+def tg(text: str) -> bool:
+    if not TG_TOKEN or not TG_CHAT: return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id":TG_CHAT,"text":text,"parse_mode":"HTML"},
+            timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"TG: {e}"); return False
 
-    # ۶.۲ چشمه معتبر (Spring):
-    # برای خرید: قیمت کمی از کف OB پایین‌تر رفته و برگشته (سایهٔ بلند پایینی)
-    spring_bull = False
-    if trend_bias == "Bullish":
-        candle_low   = l.iloc[-1]
-        candle_close = c.iloc[-1]
-        candle_open  = o.iloc[-1]
-        body = abs(candle_close - candle_open)
-        lower_wick = min(candle_close, candle_open) - candle_low
-        # اگر کندل از کف OB پایین‌تر رفته، اما بسته‌شدن بالای کف OB باشد
-        # و بدنه حداقل ۷۰٪ سایه را پوشش داده و بیش از ۵۰٪ بدنه درون OB بسته شده
-        if candle_low < ob_low and candle_close > ob_low:
-            if body > 0.7 * lower_wick and (candle_close - ob_low) > 0.5 * body:
-                spring_bull = True
+# ── DATA ─────────────────────────────────────
+_cache: dict = {}
 
-    spring_bear = False
-    if trend_bias == "Bearish":
-        candle_high  = h.iloc[-1]
-        candle_close = c.iloc[-1]
-        candle_open  = o.iloc[-1]
-        body = abs(candle_close - candle_open)
-        upper_wick = candle_high - max(candle_close, candle_open)
-        if candle_high > ob_high and candle_close < ob_high:
-            if body > 0.7 * upper_wick and (ob_high - candle_close) > 0.5 * body:
-                spring_bear = True
+def fetch(td_sym: str, interval: str, bars=150) -> Optional[pd.DataFrame]:
+    key = f"{td_sym}_{interval}"
+    int_map = {"1h":"1h","15m":"15min"}
+    for attempt in range(3):
+        try:
+            r = requests.get("https://api.twelvedata.com/time_series",
+                params={"symbol":td_sym,"interval":int_map[interval],
+                        "outputsize":bars,"apikey":TD_KEY,"format":"JSON"},
+                timeout=15)
+            data = r.json()
+            if "values" not in data:
+                raise ValueError(data.get("message","no values"))
+            df = pd.DataFrame(data["values"])
+            df.rename(columns={"open":"Open","high":"High",
+                                "low":"Low","close":"Close"},inplace=True)
+            df = df[["Open","High","Low","Close"]].apply(
+                pd.to_numeric,errors="coerce").dropna()
+            df = df.iloc[::-1].reset_index(drop=True)
+            if len(df)<10: raise ValueError("too few rows")
+            _cache[key]=df; return df
+        except Exception as e:
+            log.warning(f"{td_sym} {interval} attempt {attempt+1}: {e}")
+            time.sleep(6)
+    return _cache.get(key)
 
-    # ۶.۳ تلاش و نتیجه (Effort vs Result):
-    # کندل قبلی بزرگ بوده و نتوانسته OB را بشکند، سپس کندل جاری آن را بلعیده
-    effort_bull = effort_bear = False
-    if len(c) >= 2:
-        prev_body = abs(c.iloc[-2] - o.iloc[-2])
-        curr_body = abs(c.iloc[-1] - o.iloc[-1])
-        # برای خرید: کندل قبلی نزولی بزرگ بوده، اما به بالای کف OB نخورده،
-        # و کندل جاری صعودی و بدنه‌اش از کندل قبلی بزرگتر (انگالفینگ صعودی)
-        if (c.iloc[-2] < o.iloc[-2] and                 # کندل قبلی نزولی
-            c.iloc[-1] > o.iloc[-1] and                 # کندل جاری صعودی
-            curr_body > prev_body and                   # انگالفینگ
-            l.iloc[-2] > ob_low and                     # کندل قبلی نتوانسته OB را بشکند
-            c.iloc[-1] > o.iloc[-2]):                  # بسته‌شدن بالای بازشدن قبلی
-            effort_bull = True
+def get_price(td_sym: str) -> Optional[float]:
+    try:
+        r = requests.get("https://api.twelvedata.com/price",
+            params={"symbol":td_sym,"apikey":TD_KEY},timeout=10)
+        return float(r.json()["price"])
+    except:
+        key=f"{td_sym}_15m"; df=_cache.get(key)
+        return float(df["Close"].iloc[-1]) if df is not None else None
 
-        # برای فروش: کندل قبلی صعودی بزرگ، نتواسته سقف OB را بشکند، انگالفینگ نزولی
-        if (c.iloc[-2] > o.iloc[-2] and
-            c.iloc[-1] < o.iloc[-1] and
-            curr_body > prev_body and
-            h.iloc[-2] < ob_high and
-            c.iloc[-1] < o.iloc[-2]):
-            effort_bear = True
+# ── ANALYSIS ─────────────────────────────────
+@dataclass
+class OB:
+    high: float; low: float; mid: float
+    direction: str; strength: int=1; has_fvg: bool=False
 
-    # ── ۷. محاسبهٔ امتیاز نهایی ──
-    score = 0
-    direction = None
+def get_bias(df: pd.DataFrame) -> str:
+    if len(df)<20: return "NEUTRAL"
+    c=df["Close"]
+    e20=c.ewm(span=20).mean().iloc[-1]
+    e50=c.ewm(span=min(50,len(c)-1)).mean().iloc[-1]
+    e200=c.ewm(span=min(200,len(c)-1)).mean().iloc[-1]
+    bull=sum([c.iloc[-1]>e20, e20>e50, c.iloc[-1]>e200])
+    bear=sum([c.iloc[-1]<e20, e20<e50, c.iloc[-1]<e200])
+    if bull>=2: return "BULLISH"
+    if bear>=2: return "BEARISH"
+    return "NEUTRAL"
 
-    # امتیازدهی برای سیگنال خرید (Bullish Setup)
-    if trend_bias == "Bullish":
-        if bos_bull:                 score += 2
-        if fvg_bull:                score += 2
-        if price_in_ob:             score += 2
-        if spring_bull:             score += 3
-        if effort_bull:             score += 3
-        if ob_valid:                score += 1
-        direction = "BUY"
-        sl = ob_low - 0.5 * atr
-        # هدف: نزدیک‌ترین سقف بالاتر از قیمت فعلی (از کندل‌های بعد از OB)
-        # برای سادگی، ۲ برابر ATR به‌عنوان TP (در عمل می‌توانی سوئینگ بعدی را بگیری)
-        tp = c.iloc[-1] + 2 * atr
-        entry_price = c.iloc[-1]   # قیمت لحظه‌ای (ورود در کندل بعد)
-        entry_high = h.iloc[-1]
-        entry_low  = l.iloc[-1]
+def find_obs(df: pd.DataFrame, direction: str) -> list:
+    obs=[]; avg=(df["Close"]-df["Open"]).abs().mean()
+    d=df.tail(50).reset_index(drop=True)
+    for i in range(1,len(d)-2):
+        c,n=d.iloc[i],d.iloc[i+1]
+        if direction=="bullish" and c["Close"]<c["Open"]:
+            mv=n["Close"]-c["Low"]
+            if mv>avg*1.5 and n["Close"]>n["Open"]:
+                obs.append(OB(round(c["High"],6),round(c["Low"],6),
+                    round((c["High"]+c["Low"])/2,6),"bullish",min(5,int(mv/avg))))
+        elif direction=="bearish" and c["Close"]>c["Open"]:
+            mv=c["High"]-n["Close"]
+            if mv>avg*1.5 and n["Close"]<n["Open"]:
+                obs.append(OB(round(c["High"],6),round(c["Low"],6),
+                    round((c["High"]+c["Low"])/2,6),"bearish",min(5,int(mv/avg))))
+    return obs
 
-    # امتیازدهی برای فروش (Bearish Setup)
-    elif trend_bias == "Bearish":
-        if bos_bear:                score += 2
-        if fvg_bear:               score += 2
-        if price_in_ob:            score += 2
-        if spring_bear:            score += 3
-        if effort_bear:            score += 3
-        if ob_valid:               score += 1
-        direction = "SELL"
-        sl = ob_high + 0.5 * atr
-        tp = c.iloc[-1] - 2 * atr
-        entry_price = c.iloc[-1]
-        entry_high = h.iloc[-1]
-        entry_low  = l.iloc[-1]
-    else:
-        return None
+def in_ob(price: float, ob: OB) -> bool:
+    buf=(ob.high-ob.low)*0.15
+    return (ob.low-buf)<=price<=(ob.high+buf)
 
-    # اگر امتیاز حداقل ۴ (بدون احتساب KZ) نباشد، رد می‌کنیم.
-    # (KZ را در حلقهٔ اصلی +۱ می‌کنیم تا به MIN_SCORE برسیم)
-    if score < 4:
-        return None
+def check_fvg(df: pd.DataFrame, direction: str) -> bool:
+    d=df.tail(30).reset_index(drop=True)
+    for i in range(1,len(d)-1):
+        p,n=d.iloc[i-1],d.iloc[i+1]
+        if direction=="bullish" and p["High"]<n["Low"]: return True
+        if direction=="bearish" and p["Low"]>n["High"]: return True
+    return False
 
-    return {
-        "direction": direction,
-        "price": round(entry_price, SYMBOLS[sym]["dec"]),
-        "entry_high": round(entry_high, SYMBOLS[sym]["dec"]),
-        "entry_low": round(entry_low, SYMBOLS[sym]["dec"]),
-        "sl": round(sl, SYMBOLS[sym]["dec"]),
-        "tp": round(tp, SYMBOLS[sym]["dec"]),
-        "score": score,
-        "bias": trend_bias
-    }
+def check_bos(df: pd.DataFrame, direction: str) -> bool:
+    d=df.tail(20).reset_index(drop=True)
+    if len(d)<10: return False
+    f,s=d.head(10),d.tail(10)
+    if direction=="bullish": return s["Close"].max()>f["High"].max()
+    return s["Close"].min()<f["Low"].min()
+
+def calc_atr(df: pd.DataFrame, p=14) -> float:
+    h,l,c=df["High"],df["Low"],df["Close"].shift(1)
+    return pd.concat([h-l,(h-c).abs(),(l-c).abs()],
+        axis=1).max(axis=1).rolling(p).mean().iloc[-1]
+
+def find_ob_wyckoff(df: pd.DataFrame, direction: str):
+    o=df["Open"]; h=df["High"]; l=df["Low"]; c=df["Close"]
+    avg_body=(c-o).abs().rolling(20).mean().iloc[-1]
+    for i in range(len(c)-2,1,-1):
+        body=abs(c.iloc[i]-o.iloc[i])
+        uw=h.iloc[i]-max(c.iloc[i],o.iloc[i])
+        lw=min(c.iloc[i],o.iloc[i])-l.iloc[i]
+        quality=body>1.5*avg_body and uw<0.3*body and lw<0.3*body
+        if direction=="bullish":
+            if c.iloc[i]<o.iloc[i] and c.iloc[i+1]>o.iloc[i+1] and quality:
+                return OB(round(h.iloc[i],6),round(l.iloc[i],6),round((h.iloc[i]+l.iloc[i])/2,6),"bullish",3)
+        else:
+            if c.iloc[i]>o.iloc[i] and c.iloc[i+1]<o.iloc[i+1] and quality:
+                return OB(round(h.iloc[i],6),round(l.iloc[i],6),round((h.iloc[i]+l.iloc[i])/2,6),"bearish",3)
+    return None
+
+def check_spring(df: pd.DataFrame, ob: OB, direction: str) -> bool:
+    c=df["Close"]; o=df["Open"]; h=df["High"]; l=df["Low"]
+    body=abs(c.iloc[-1]-o.iloc[-1])
+    if direction=="bullish":
+        lw=min(c.iloc[-1],o.iloc[-1])-l.iloc[-1]
+        return bool(l.iloc[-1]<ob.low and c.iloc[-1]>ob.low and lw>0 and body>0.7*lw)
+    uw=h.iloc[-1]-max(c.iloc[-1],o.iloc[-1])
+    return bool(h.iloc[-1]>ob.high and c.iloc[-1]<ob.high and uw>0 and body>0.7*uw)
+
+def check_effort(df: pd.DataFrame, direction: str) -> bool:
+    c=df["Close"]; o=df["Open"]
+    pb=abs(c.iloc[-2]-o.iloc[-2]); cb=abs(c.iloc[-1]-o.iloc[-1])
+    if direction=="bullish":
+        return bool(c.iloc[-2]<o.iloc[-2] and c.iloc[-1]>o.iloc[-1] and cb>pb and c.iloc[-1]>o.iloc[-2])
+    return bool(c.iloc[-2]>o.iloc[-2] and c.iloc[-1]<o.iloc[-1] and cb>pb and c.iloc[-1]<o.iloc[-2])
+
+def calc_score(ob, bos, fvg, kz, spring=False, effort=False) -> int:
+    s=0
+    if bos:    s+=2
+    if fvg:    s+=2
+    if kz:     s+=1
+    if spring: s+=3
+    if effort: s+=3
+    if ob:     s+=1
+    return min(s,10)
+
+# ── ALERTS ───────────────────────────────────
+def fmt(p, dec): return f"{p:.{dec}f}"
+
+def alert_entry(sym, cfg, direction, price, eh, el, sl, tp, score, kz, sid):
+    e="🟢" if direction=="BUY" else "🔴"
+    d=cfg["dec"]; em=cfg["emoji"]
+    risk=abs(price-sl); reward=abs(tp-price)
+    rr=round(reward/risk,1) if risk>0 else 0
+    thr=(datetime.now(timezone.utc)+timedelta(hours=3,minutes=30)).strftime("%H:%M")
+    tg(
+        f"{e} <b>{em} {sym} — {direction}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Price: {fmt(price,d)}\n"
+        f"📍 Entry: {fmt(el,d)} – {fmt(eh,d)}\n"
+        f"🛑 SL: {fmt(sl,d)}\n"
+        f"🎯 TP: {fmt(tp,d)}\n"
+        f"📊 R:R = 1:{rr}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ {kz}\n"
+        f"🏆 Score: {score}/10\n"
+        f"⚠️ Risk max 1% | 🕐 {thr}\n"
+        f"🔖 #{sid}"
+    )
+
+def alert_tp(sym, cfg, direction, price, r, sid):
+    tg(f"🎯 <b>{cfg['emoji']} {sym} TP HIT! 🎉</b>\n"
+       f"Direction: {direction}\n"
+       f"Exit: {fmt(price,cfg['dec'])}\n"
+       f"<b>Result: {r:+.1f}R ✅</b>\n"
+       f"🔖 #{sid}")
+
+def alert_sl(sym, cfg, direction, price, r, sid):
+    tg(f"🛑 <b>{cfg['emoji']} {sym} SL HIT</b>\n"
+       f"Direction: {direction}\n"
+       f"Exit: {fmt(price,cfg['dec'])}\n"
+       f"<b>Result: {r:+.1f}R ❌</b>\n"
+       f"🔖 #{sid}")
+
+def alert_monthly(s: dict):
+    now=datetime.now(timezone.utc)
+    sym_lines="\n".join(
+        f"   {sym}: {v[0]}W/{v[1]}L"
+        for sym,v in s["by_sym"].items())
+    kz_lines="\n".join(
+        f"   {kz}: {v[0]}W/{v[1]}L"
+        for kz,v in s["by_kz"].items() if kz)
+    tg(
+        f"📊 <b>MONTHLY REPORT — {now.strftime('%B %Y')}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Total: {s['total']}\n"
+        f"✅ Wins: {s['wins']} | ❌ Losses: {s['losses']} | ⏳ Open: {s['opens']}\n"
+        f"🏆 Win Rate: {s['wr']}%\n"
+        f"💰 Net R: {s['net']:+.1f}R\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 By Symbol:\n{sym_lines}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ By Kill Zone:\n{kz_lines}\n"
+        f"{'📈 Profitable month! 🎉' if s['net']>0 else '📉 Keep going! 💪'}"
+    )
+
+# ── TRACKER ──────────────────────────────────
+class Tracker:
+    def __init__(self):
+        self.open: dict = {}
+
+    def add(self, sid, sym, direction, price, sl, tp):
+        self.open[sid]=(sym,direction,price,sl,tp)
+
+    def check_all(self):
+        closed=[]
+        for sid,(sym,direction,entry,sl,tp) in self.open.items():
+            cfg=SYMBOLS[sym]
+            price=get_price(cfg["td"])
+            if price is None: continue
+            risk=abs(entry-sl)
+            if risk==0: continue
+            if direction=="BUY":
+                if price<=sl:
+                    r=round((price-entry)/risk,2)
+                    close_signal(sid,"LOSS",price,r)
+                    alert_sl(sym,cfg,direction,price,r,sid)
+                    closed.append(sid)
+                elif price>=tp:
+                    r=round((price-entry)/risk,2)
+                    close_signal(sid,"WIN",price,r)
+                    alert_tp(sym,cfg,direction,price,r,sid)
+                    closed.append(sid)
+            else:
+                if price>=sl:
+                    r=round((entry-price)/risk,2)
+                    close_signal(sid,"LOSS",price,r)
+                    alert_sl(sym,cfg,direction,price,r,sid)
+                    closed.append(sid)
+                elif price<=tp:
+                    r=round((entry-price)/risk,2)
+                    close_signal(sid,"WIN",price,r)
+                    alert_tp(sym,cfg,direction,price,r,sid)
+                    closed.append(sid)
+            time.sleep(2)
+        for sid in closed:
+            del self.open[sid]
+
+# ── MAIN ─────────────────────────────────────
+class MultiBot:
+    def __init__(self):
+        init_db()
+        self.last_alerts: dict={}
+        self.tracker=Tracker()
+        self.last_monthly: Optional[datetime]=None
+        self.cycle=0
+
+    def can_alert(self, sym: str) -> bool:
+        t=self.last_alerts.get(sym)
+        if not t: return True
+        return (datetime.now(timezone.utc)-t).seconds//60>=COOLDOWN
+
+    def analyze(self, sym: str, cfg: dict, kz: str) -> bool:
+        td=cfg["td"]
+        df_1h=fetch(td,"1h",150)
+        df_15=fetch(td,"15m",100)
+        if df_1h is None or df_15 is None: return False
+
+        price=get_price(td)
+        if price is None: return False
+
+        b=get_bias(df_1h)
+        if b=="NEUTRAL": log.info(f"{sym}: NEUTRAL"); return False
+
+        direction="BUY" if b=="BULLISH" else "SELL"
+        od="bullish" if direction=="BUY" else "bearish"
+
+        obs=find_obs(df_1h,od)
+        nearest=None
+        for ob in obs:
+            if in_ob(price,ob):
+                if nearest is None or abs(ob.mid-price)<abs(nearest.mid-price):
+                    nearest=ob
+
+        if not nearest: log.info(f"{sym}: Not in OB"); return False
+
+        fvg=check_fvg(df_1h,od)
+        bos=check_bos(df_15,od)
+        nearest.has_fvg=fvg
+        sc=calc_score(nearest,bos,fvg,kz)
+        log.info(f"{sym}: {direction} BOS:{bos} FVG:{fvg} KZ:{kz} Score:{sc}")
+
+        if sc<MIN_SCORE: return False
+
+        atr=calc_atr(df_1h); buf=atr*0.3
+        if direction=="BUY":
+            sl=round(nearest.low-buf,cfg["dec"])
+            risk=price-sl
+            tp=round(price+risk*2,cfg["dec"])
+        else:
+            sl=round(nearest.high+buf,cfg["dec"])
+            risk=sl-price
+            tp=round(price-risk*2,cfg["dec"])
+
+        if risk<=0: return False
+
+        sid=save_signal(sym,direction,price,nearest.high,
+                        nearest.low,sl,tp,sc,b,kz)
+        alert_entry(sym,cfg,direction,price,nearest.high,
+                    nearest.low,sl,tp,sc,kz,sid)
+        self.tracker.add(sid,sym,direction,price,sl,tp)
+        self.last_alerts[sym]=datetime.now(timezone.utc)
+        log.info(f"✅ {sym} #{sid} sent!")
+        return True
+
+    def check_monthly(self):
+        now=datetime.now(timezone.utc)
+        if now.day==1 and now.hour==8:
+            if not self.last_monthly or (now-self.last_monthly).days>=28:
+                alert_monthly(monthly_stats())
+                self.last_monthly=now
+
+    def run(self):
+        log.info("="*50)
+        log.info("  Multi-Symbol Bot v5 — High Win Rate")
+        log.info("="*50)
+        syms=", ".join(SYMBOLS.keys())
+        tg(f"🤖 <b>Multi-Symbol Bot v5</b>\n"
+           f"📊 {syms}\n"
+           f"⚡ EMA + OB + FVG + BOS + KillZone\n"
+           f"🎯 Target WR: 78-82% | R:R 1:2\n"
+           f"✅ Active!")
+
+        while True:
+            self.cycle+=1
+            log.info(f"══ Cycle {self.cycle} ══")
+            try:
+                if self.tracker.open:
+                    self.tracker.check_all()
+
+                if is_weekend():
+                    log.info("Weekend — skipping analysis.")
+                else:
+                    kz=get_kill_zone()
+                    if kz:
+                        log.info(f"Kill Zone: {kz}")
+                        for sym,cfg in SYMBOLS.items():
+                            if not self.can_alert(sym): continue
+                            try:
+                                self.analyze(sym,cfg,kz)
+                                time.sleep(6)
+                            except Exception as e:
+                                log.error(f"{sym}: {e}")
+                    else:
+                        log.info("Not in Kill Zone.")
+
+                self.check_monthly()
+            except Exception as e:
+                log.error(f"Cycle: {e}",exc_info=True)
+
+            log.info(f"Next in {INTERVAL//60}min...")
+            time.sleep(INTERVAL)
+
+if __name__=="__main__":
+    MultiBot().run()
